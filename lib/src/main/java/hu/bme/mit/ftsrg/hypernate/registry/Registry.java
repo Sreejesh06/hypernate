@@ -3,6 +3,7 @@ package hu.bme.mit.ftsrg.hypernate.registry;
 
 import com.jcabi.aspects.Loggable;
 import hu.bme.mit.ftsrg.hypernate.annotations.AttributeInfo;
+import hu.bme.mit.ftsrg.hypernate.annotations.EntityType;
 import hu.bme.mit.ftsrg.hypernate.annotations.PrimaryKey;
 import hu.bme.mit.ftsrg.hypernate.util.JSON;
 import java.lang.reflect.Constructor;
@@ -31,6 +32,10 @@ public class Registry {
     this.stub = stub;
   }
 
+  ChaincodeStub getStub() {
+    return stub;
+  }
+
   /**
    * Create a new entity.
    *
@@ -44,6 +49,7 @@ public class Registry {
     final String key = getCompositeKey(entity);
     final byte[] buffer = EntityUtil.toBuffer(entity);
     stub.putState(key, buffer);
+    applyEndorsementPolicyIfPresent(entity, key);
   }
 
   /**
@@ -77,6 +83,7 @@ public class Registry {
     final String key = getCompositeKey(entity);
     final byte[] buffer = EntityUtil.toBuffer(entity);
     stub.putState(key, buffer);
+    applyEndorsementPolicyIfPresent(entity, key);
   }
 
   /**
@@ -190,20 +197,72 @@ public class Registry {
    */
   public <T> List<T> readAll(final Class<T> clazz) {
     final String key = stub.createCompositeKey(EntityUtil.getType(clazz)).toString();
-    Iterator<KeyValue> iterator = stub.getStateByPartialCompositeKey(key).iterator();
-    Iterable<KeyValue> iterable = () -> iterator;
+    try (org.hyperledger.fabric.shim.ledger.QueryResultsIterator<KeyValue> iterator =
+        stub.getStateByPartialCompositeKey(key)) {
+      return collectResults(iterator, clazz);
+    } catch (Exception e) {
+      throw new RuntimeException("Failed to read all entities", e);
+    }
+  }
+
+  /**
+   * Start a fluent CouchDB rich query for the given entity type.
+   *
+   * @param clazz the entity class
+   * @return a {@link RichQueryBuilder} instance
+   */
+  public <T> RichQueryBuilder<T> query(Class<T> clazz) {
+    return new RichQueryBuilder<>(this, clazz);
+  }
+
+  /**
+   * Start a fluent composite key range scan for the given entity type.
+   *
+   * @param clazz the entity class
+   * @return a {@link RangeQueryBuilder} instance
+   */
+  public <T> RangeQueryBuilder<T> rangeQuery(Class<T> clazz) {
+    return new RangeQueryBuilder<>(this, clazz);
+  }
+
+  <T> List<T> collectResults(
+      org.hyperledger.fabric.shim.ledger.QueryResultsIterator<KeyValue> iterator, Class<T> clazz) {
+    Iterable<KeyValue> iterable = () -> iterator.iterator();
     return StreamSupport.stream(iterable.spliterator(), false)
         .map(
             kv -> {
               final byte[] value = kv.getValue();
-              logger.debug(
-                  "Found value at partial key {}: {} -> {}",
-                  key,
-                  kv.getKey(),
-                  Arrays.toString(value));
+              logger.debug("Found value at key {}: {}", kv.getKey(), Arrays.toString(value));
               return EntityUtil.fromBuffer(value, clazz);
             })
         .collect(Collectors.toList());
+  }
+
+  /**
+   * Dynamically set a state-based endorsement policy for an asset.
+   *
+   * @param entity the entity to apply the policy to
+   * @param policy the compiled endorsement policy
+   * @param <T> the entity type
+   */
+  public <T> void setEndorsementPolicy(
+      T entity, hu.bme.mit.ftsrg.hypernate.endorsement.EndorsementPolicy policy) {
+    if (!exists(entity)) {
+      throw new EntityNotFoundException("Cannot set endorsement policy: entity does not exist");
+    }
+    stub.setStateValidationParameter(getCompositeKey(entity), policy.getPolicyBytes());
+  }
+
+  private <T> void applyEndorsementPolicyIfPresent(T entity, String key) {
+    hu.bme.mit.ftsrg.hypernate.annotations.EndorsementPolicy annot =
+        entity
+            .getClass()
+            .getAnnotation(hu.bme.mit.ftsrg.hypernate.annotations.EndorsementPolicy.class);
+    if (annot != null) {
+      hu.bme.mit.ftsrg.hypernate.endorsement.EndorsementPolicy policy =
+          hu.bme.mit.ftsrg.hypernate.endorsement.EndorsementPolicy.of(annot.value());
+      stub.setStateValidationParameter(key, policy.getPolicyBytes());
+    }
   }
 
   @Loggable(Loggable.DEBUG)
@@ -237,7 +296,7 @@ public class Registry {
   }
 
   @UtilityClass
-  private class EntityUtil {
+  class EntityUtil {
 
     private final Logger logger = LoggerFactory.getLogger(EntityUtil.class);
 
@@ -246,7 +305,19 @@ public class Registry {
     }
 
     <T> String getType(final Class<T> clazz) {
-      return clazz.getName().toUpperCase();
+      final EntityType annot = clazz.getAnnotation(EntityType.class);
+      if (annot == null) {
+        return clazz.getName();
+      }
+
+      final String value = annot.value();
+      if (value.isBlank()) {
+        throw new IllegalArgumentException(
+            String.format(
+                "The @EntityType annotation on class %s has an empty or blank value",
+                clazz.getName()));
+      }
+      return value;
     }
 
     <T> int getPrimaryKeyCount(final Class<T> clazz) {
